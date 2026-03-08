@@ -25,6 +25,8 @@ ENV/
 
 .env
 .env.*
+credentials.json
+token.json
 
 # -----------------------------
 
