@@ -1,88 +1,311 @@
-# Simple in-memory storage
-ORDERS_DB = {"orders": {}, "next_id": 1}
-DRUG_DB = {
-    "aspirin": {"name": "Acetylsalicylic Acid", "price": 5.99,
-                "description": "Non-steroidal anti-inflammatory drug for pain relief and fever reduction",
-                "quantity": 30},
-    "ibuprofen": {"name": "Ibuprofen", "price": 7.99,
-                  "description": "Anti-inflammatory medication for pain and inflammation management", "quantity": 20},
-    "acetaminophen": {"name": "Acetaminophen", "price": 6.99,
-                      "description": "Analgesic and antipyretic medication for pain and fever control", "quantity": 25},
-    "metformin": {"name": "Metformin Hydrochloride", "price": 12.50,
-                  "description": "Biguanide antidiabetic medication for type 2 diabetes management", "quantity": 60},
-    "lisinopril": {"name": "Lisinopril", "price": 8.75,
-                   "description": "ACE inhibitor for hypertension and heart failure treatment", "quantity": 30},
-    "atorvastatin": {"name": "Atorvastatin Calcium", "price": 15.25,
-                     "description": "HMG-CoA reductase inhibitor for cholesterol management", "quantity": 30},
-    "omeprazole": {"name": "Omeprazole", "price": 11.99,
-                   "description": "Proton pump inhibitor for acid reflux and ulcer treatment", "quantity": 28},
-    "amlodipine": {"name": "Amlodipine Besylate", "price": 9.50,
-                   "description": "Calcium channel blocker for hypertension and angina", "quantity": 30},
-    "metoprolol": {"name": "Metoprolol Tartrate", "price": 7.25,
-                   "description": "Beta-blocker for hypertension and heart rhythm disorders", "quantity": 30},
-    "sertraline": {"name": "Sertraline Hydrochloride", "price": 13.75,
-                   "description": "Selective serotonin reuptake inhibitor for depression and anxiety", "quantity": 30}
-}
+import os
+from datetime import date, datetime, time, timedelta
+import re
+import uuid
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-def get_drug_info(drug_name):
-    """Get drug information."""
-    drug = DRUG_DB.get(drug_name.lower())
-    if drug:
-        return {
-            "name": drug["name"],
-            "description": drug["description"],
-            "price": drug["price"],
-            "quantity": drug["quantity"]
-        }
-    return {"error": f"Drug '{drug_name}' not found"}
+def _env_required(name):
+    value = os.getenv(name)
+    if not value:
+        raise ValueError(f"Missing required environment variable: {name}")
+    return value
 
 
-def place_order(customer_name, drug_name):
-    """Place a simple order with predefined quantity."""
-    drug = DRUG_DB.get(drug_name.lower())
-    if not drug:
-        return {"error": f"Drug '{drug_name}' not found"}
+def _parse_time(value):
+    return datetime.strptime(value, "%H:%M").time()
 
-    order_id = ORDERS_DB["next_id"]
-    ORDERS_DB["next_id"] += 1
 
-    order = {
-        "id": order_id,
-        "customer": customer_name,
-        "drug": drug["name"],
-        "quantity": drug["quantity"],
-        "total": drug["price"],
-        "status": "pending"
-    }
-    ORDERS_DB["orders"][order_id] = order
+def _slot_minutes():
+    return int(os.getenv("SLOT_MINUTES", "20"))
 
+
+def _open_time():
+    return _parse_time(os.getenv("HOSPITAL_OPEN_TIME", "10:00"))
+
+
+def _close_time():
+    return _parse_time(os.getenv("HOSPITAL_CLOSE_TIME", "18:00"))
+
+
+def _closed_weekday():
+    return int(os.getenv("HOSPITAL_CLOSED_WEEKDAY", "6"))
+
+
+def _doctor_map():
     return {
-        "order_id": order_id,
-        "message": f"Order {order_id} placed: {drug['quantity']} {drug['name']} for ${order['total']:.2f}",
-        "total": order['total'],
-        "quantity": drug['quantity']
+        os.getenv("DOCTOR_1_NAME", "Dr First").strip().lower(): os.getenv("DOCTOR_1_NAME", "Dr First").strip(),
+        os.getenv("DOCTOR_2_NAME", "Dr Second").strip().lower(): os.getenv("DOCTOR_2_NAME", "Dr Second").strip(),
     }
 
 
-def lookup_order(order_id):
-    """Look up an order."""
-    order = ORDERS_DB["orders"].get(int(order_id))
-    if order:
-        return {
-            "order_id": order_id,
-            "customer": order["customer"],
-            "drug": order["drug"],
-            "quantity": order["quantity"],
-            "total": order["total"],
-            "status": order["status"]
+def _status_field_name():
+    return os.getenv("AIRTABLE_STATUS_FIELD", "status copy")
+
+
+def _normalize_doctor_name(doctor_name):
+    if not doctor_name:
+        return None
+    doctors = _doctor_map()
+    normalized = doctor_name.strip().lower().replace(".", "")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return doctors.get(normalized)
+
+
+def _parse_date(value):
+    return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _parse_slot_time(value):
+    return datetime.strptime(value, "%H:%M").time()
+
+
+def _is_slot_boundary(slot):
+    open_t = _open_time()
+    open_minutes = open_t.hour * 60 + open_t.minute
+    slot_minutes = slot.hour * 60 + slot.minute
+    diff = slot_minutes - open_minutes
+    return diff >= 0 and diff % _slot_minutes() == 0
+
+
+def _is_hospital_open(appointment_date, appointment_time):
+    if appointment_date.weekday() == _closed_weekday():
+        return False, "Hospital is closed on this day."
+
+    open_t = _open_time()
+    close_t = _close_time()
+    if appointment_time < open_t or appointment_time >= close_t:
+        return False, f"Hospital timings are {open_t.strftime('%H:%M')} to {close_t.strftime('%H:%M')}."
+
+    if not _is_slot_boundary(appointment_time):
+        return False, f"Appointments are available every {_slot_minutes()} minutes only."
+
+    return True, "Open"
+
+
+def _airtable_headers():
+    token = _env_required("AIRTABLE_API_TOKEN")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _airtable_url():
+    base_id = _env_required("AIRTABLE_BASE_ID")
+    table_name = _env_required("AIRTABLE_TABLE_NAME")
+    return f"https://api.airtable.com/v0/{base_id}/{table_name}"
+
+
+def _airtable_list_records(filter_formula=None, max_records=100):
+    params = {"maxRecords": max_records}
+    if filter_formula:
+        params["filterByFormula"] = filter_formula
+
+    response = requests.get(
+        _airtable_url(),
+        headers=_airtable_headers(),
+        params=params,
+        timeout=20,
+    )
+    response.raise_for_status()
+    return response.json().get("records", [])
+
+
+def _airtable_create_record(fields):
+    response = requests.post(
+        _airtable_url(),
+        headers=_airtable_headers(),
+        json={"fields": fields},
+        timeout=20,
+    )
+    if not response.ok:
+        raise Exception(f"Airtable create failed: {response.status_code} - {response.text}")
+    return response.json()
+
+
+def _airtable_update_record(record_id, fields):
+    response = requests.patch(
+        f"{_airtable_url()}/{record_id}",
+        headers=_airtable_headers(),
+        json={"fields": fields},
+        timeout=20,
+    )
+    if not response.ok:
+        raise Exception(f"Airtable update failed: {response.status_code} - {response.text}")
+    return response.json()
+
+
+def _booked_records_for_doctor_date(doctor_name, appointment_date):
+    status_field = _status_field_name()
+    formula = (
+        "AND("
+        f"{{doctor_name}}='{doctor_name}',"
+        f"{{appointment_date}}='{appointment_date.isoformat()}',"
+        f"{{{status_field}}}='Booked'"
+        ")"
+    )
+    return _airtable_list_records(filter_formula=formula)
+
+
+def get_supported_doctors():
+    doctors = list(_doctor_map().values())
+    return {"doctors": doctors}
+
+
+def get_available_slots(doctor_name, appointment_date):
+    try:
+        normalized_doctor = _normalize_doctor_name(doctor_name)
+        if not normalized_doctor:
+            return {"error": "Doctor not found", "supported_doctors": list(_doctor_map().values())}
+
+        booking_date = _parse_date(appointment_date)
+        open_result, reason = _is_hospital_open(booking_date, _open_time())
+        if not open_result:
+            return {"doctor": normalized_doctor, "date": appointment_date, "available_slots": [], "message": reason}
+
+        booked = _booked_records_for_doctor_date(normalized_doctor, booking_date)
+        booked_times = {
+            record.get("fields", {}).get("appointment_time")
+            for record in booked
+            if record.get("fields", {}).get("appointment_time")
         }
-    return {"error": f"Order {order_id} not found"}
+
+        slots = []
+        cursor = datetime.combine(booking_date, _open_time())
+        end_dt = datetime.combine(booking_date, _close_time())
+
+        while cursor < end_dt:
+            slot = cursor.time().strftime("%H:%M")
+            if slot not in booked_times:
+                slots.append(slot)
+            cursor += timedelta(minutes=_slot_minutes())
+
+        return {
+            "doctor": normalized_doctor,
+            "date": appointment_date,
+            "available_slots": slots,
+            "total_available": len(slots),
+        }
+    except Exception as exc:
+        return {"error": f"Failed to fetch available slots: {str(exc)}"}
 
 
-# Function mapping dictionary
+def book_appointment(doctor_name, patient_name, phone, appointment_date, appointment_time):
+    try:
+        normalized_doctor = _normalize_doctor_name(doctor_name)
+        if not normalized_doctor:
+            return {"error": "Doctor not found", "supported_doctors": list(_doctor_map().values())}
+
+        booking_date = _parse_date(appointment_date)
+        booking_time = _parse_slot_time(appointment_time)
+
+        is_open, reason = _is_hospital_open(booking_date, booking_time)
+        if not is_open:
+            return {"error": reason}
+
+        booked = _booked_records_for_doctor_date(normalized_doctor, booking_date)
+        requested_time = booking_time.strftime("%H:%M")
+        generated_appointment_id = f"APT-{uuid.uuid4().hex[:8].upper()}"
+        for record in booked:
+            existing_time = record.get("fields", {}).get("appointment_time")
+            if existing_time == requested_time:
+                return {
+                    "error": f"Slot {requested_time} is already booked for {normalized_doctor}.",
+                    "doctor": normalized_doctor,
+                    "date": appointment_date,
+                    "time": requested_time,
+                }
+
+        created = _airtable_create_record(
+            {
+                "appointment_id": generated_appointment_id,
+                "doctor_name": normalized_doctor,
+                "patient_name": patient_name,
+                "phone": phone,
+                "appointment_date": booking_date.isoformat(),
+                "appointment_time": requested_time,
+                _status_field_name(): "Booked",
+            }
+        )
+
+        appointment_record_id = created.get("id")
+
+        return {
+            "appointment_id": created.get("fields", {}).get("appointment_id", generated_appointment_id),
+            "airtable_record_id": appointment_record_id,
+            "doctor": normalized_doctor,
+            "patient_name": patient_name,
+            "phone": phone,
+            "date": booking_date.isoformat(),
+            "time": requested_time,
+            "status": "Booked",
+            "message": "Appointment booked successfully.",
+        }
+    except Exception as exc:
+        return {"error": f"Failed to book appointment: {str(exc)}"}
+
+
+def list_doctor_appointments(doctor_name, appointment_date):
+    try:
+        normalized_doctor = _normalize_doctor_name(doctor_name)
+        if not normalized_doctor:
+            return {"error": "Doctor not found", "supported_doctors": list(_doctor_map().values())}
+
+        booking_date = _parse_date(appointment_date)
+        records = _booked_records_for_doctor_date(normalized_doctor, booking_date)
+
+        appointments = []
+        for record in records:
+            fields = record.get("fields", {})
+            appointments.append(
+                {
+                    "appointment_id": record.get("id"),
+                    "doctor": fields.get("doctor_name"),
+                    "patient_name": fields.get("patient_name"),
+                    "phone": fields.get("phone"),
+                    "date": fields.get("appointment_date"),
+                    "time": fields.get("appointment_time"),
+                    "status": fields.get(_status_field_name()),
+                }
+            )
+
+        appointments.sort(key=lambda item: item.get("time") or "")
+
+        return {
+            "doctor": normalized_doctor,
+            "date": booking_date.isoformat(),
+            "appointments": appointments,
+            "total": len(appointments),
+        }
+    except Exception as exc:
+        return {"error": f"Failed to list appointments: {str(exc)}"}
+
+
+def cancel_appointment(appointment_id):
+    try:
+        updated = _airtable_update_record(appointment_id, {_status_field_name(): "Cancelled"})
+        fields = updated.get("fields", {})
+        return {
+            "appointment_id": updated.get("id"),
+            "doctor": fields.get("doctor_name"),
+            "date": fields.get("appointment_date"),
+            "time": fields.get("appointment_time"),
+            "status": fields.get(_status_field_name()),
+            "message": "Appointment cancelled successfully.",
+        }
+    except Exception as exc:
+        return {"error": f"Failed to cancel appointment: {str(exc)}"}
+
+
 FUNCTION_MAP = {
-    'get_drug_info': get_drug_info,
-    'place_order': place_order,
-    'lookup_order': lookup_order
+    "get_supported_doctors": get_supported_doctors,
+    "get_available_slots": get_available_slots,
+    "book_appointment": book_appointment,
+    "list_doctor_appointments": list_doctor_appointments,
+    "cancel_appointment": cancel_appointment,
 }
