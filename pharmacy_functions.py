@@ -147,6 +147,23 @@ def _airtable_update_record(record_id, fields):
     return response.json()
 
 
+def _find_record_by_any_appointment_id(appointment_id):
+    needle = str(appointment_id or "").strip()
+    if not needle:
+        return None
+
+    records = _airtable_list_records(max_records=1000)
+    for record in records:
+        if record.get("id") == needle:
+            return record
+
+        fields = record.get("fields", {})
+        if str(fields.get("appointment_id") or "").strip() == needle:
+            return record
+
+    return None
+
+
 def _normalize_date_text(value):
     if value is None:
         return None
@@ -232,6 +249,21 @@ def _is_doctor_slot_available(doctor_name, appointment_date, appointment_time):
     return True
 
 
+def _find_existing_booked_patient_appointment(doctor_name, appointment_date, patient_name, phone):
+    records = _booked_records_for_doctor_date(doctor_name, appointment_date)
+    target_patient = str(patient_name or "").strip().lower()
+    target_phone = str(phone or "").strip()
+
+    for record in records:
+        fields = record.get("fields", {})
+        existing_patient = str(fields.get("patient_name") or "").strip().lower()
+        existing_phone = str(fields.get("phone") or "").strip()
+        if existing_patient == target_patient and existing_phone == target_phone:
+            return record
+
+    return None
+
+
 def _other_doctors_available_same_slot(current_doctor, appointment_date, appointment_time):
     alternatives = []
     for doctor in _doctor_map().values():
@@ -301,6 +333,56 @@ def book_appointment(doctor_name, patient_name, phone, appointment_date, appoint
             return {"error": reason}
 
         requested_time = booking_time.strftime("%H:%M")
+        existing_record = _find_existing_booked_patient_appointment(
+            normalized_doctor,
+            booking_date,
+            patient_name,
+            phone,
+        )
+
+        if existing_record:
+            existing_fields = existing_record.get("fields", {})
+            existing_time = _normalize_time_text(existing_fields.get("appointment_time"))
+            existing_business_id = existing_fields.get("appointment_id") or existing_record.get("id")
+
+            if existing_time == requested_time:
+                return {
+                    "appointment_id": existing_business_id,
+                    "airtable_record_id": existing_record.get("id"),
+                    "doctor": normalized_doctor,
+                    "patient_name": patient_name,
+                    "phone": phone,
+                    "date": booking_date.isoformat(),
+                    "time": requested_time,
+                    "status": "Booked",
+                    "message": "Appointment already exists for this date and time.",
+                }
+
+            if not _is_doctor_slot_available(normalized_doctor, booking_date, booking_time):
+                return {
+                    "error": (
+                        f"Slot {requested_time} is already booked for {normalized_doctor}. "
+                        "Please choose another slot."
+                    ),
+                    "doctor": normalized_doctor,
+                    "date": appointment_date,
+                    "time": requested_time,
+                }
+
+            updated = _airtable_update_record(existing_record.get("id"), {"appointment_time": requested_time})
+            updated_fields = updated.get("fields", {})
+            return {
+                "appointment_id": updated_fields.get("appointment_id") or existing_business_id,
+                "airtable_record_id": updated.get("id"),
+                "doctor": updated_fields.get("doctor_name", normalized_doctor),
+                "patient_name": updated_fields.get("patient_name", patient_name),
+                "phone": updated_fields.get("phone", phone),
+                "date": updated_fields.get("appointment_date", booking_date.isoformat()),
+                "time": _normalize_time_text(updated_fields.get("appointment_time")) or requested_time,
+                "status": updated_fields.get(_status_field_name(), "Booked"),
+                "message": "Appointment updated successfully.",
+            }
+
         generated_appointment_id = f"APT-{uuid.uuid4().hex[:8].upper()}"
 
         if not _is_doctor_slot_available(normalized_doctor, booking_date, booking_time):
@@ -357,7 +439,8 @@ def list_doctor_appointments(doctor_name, appointment_date):
             fields = record.get("fields", {})
             appointments.append(
                 {
-                    "appointment_id": record.get("id"),
+                    "appointment_id": fields.get("appointment_id") or record.get("id"),
+                    "airtable_record_id": record.get("id"),
                     "doctor": fields.get("doctor_name"),
                     "patient_name": fields.get("patient_name"),
                     "phone": fields.get("phone"),
@@ -381,10 +464,15 @@ def list_doctor_appointments(doctor_name, appointment_date):
 
 def cancel_appointment(appointment_id):
     try:
-        updated = _airtable_update_record(appointment_id, {_status_field_name(): "Cancelled"})
+        record = _find_record_by_any_appointment_id(appointment_id)
+        if not record:
+            return {"error": f"Appointment not found: {appointment_id}"}
+
+        updated = _airtable_update_record(record.get("id"), {_status_field_name(): "Cancelled"})
         fields = updated.get("fields", {})
         return {
-            "appointment_id": updated.get("id"),
+            "appointment_id": fields.get("appointment_id") or updated.get("id"),
+            "airtable_record_id": updated.get("id"),
             "doctor": fields.get("doctor_name"),
             "date": fields.get("appointment_date"),
             "time": fields.get("appointment_time"),
