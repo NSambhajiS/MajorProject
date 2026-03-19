@@ -53,6 +53,13 @@ def _normalize_doctor_name(doctor_name):
     doctors = _doctor_map()
     normalized = doctor_name.strip().lower().replace(".", "")
     normalized = re.sub(r"\s+", " ", normalized)
+    direct = doctors.get(normalized)
+    if direct:
+        return direct
+
+    # Accept natural variants from speech like "doctor first" and map to "Dr First".
+    normalized = re.sub(r"\bdoctor\b", "dr", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
     return doctors.get(normalized)
 
 
