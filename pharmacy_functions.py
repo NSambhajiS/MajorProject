@@ -190,14 +190,12 @@ def _normalize_time_text(value):
 
 def _booked_records_for_doctor_date(doctor_name, appointment_date):
     status_field = _status_field_name()
-    formula = (
-        "AND("
-        f"{{doctor_name}}='{doctor_name}',"
-        f"{{appointment_date}}='{appointment_date.isoformat()}',"
-        f"{{{status_field}}}='Booked'"
-        ")"
-    )
-    return _airtable_list_records(filter_formula=formula)
+    records = _records_for_doctor_date(doctor_name, appointment_date)
+    return [
+        record
+        for record in records
+        if str(record.get("fields", {}).get(status_field) or "").strip().lower() == "booked"
+    ]
 
 
 def _records_for_doctor_date(doctor_name, appointment_date):
